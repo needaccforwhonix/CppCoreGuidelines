@@ -1,6 +1,6 @@
 # <a name="main"></a>C++ Core Guidelines
 
-Jul 8, 2025
+Jun 14, 2026
 
 Editors:
 
@@ -3037,10 +3037,11 @@ If you need the notion of an optional value, use a pointer, `std::optional`, or 
 
 ##### Enforcement
 
-* (Simple) ((Foundation)) Warn when a parameter being passed by value has a size greater than `2 * sizeof(void*)`.
+* (Simple) ((Foundation)) Warn when a parameter being passed by value has a size greater than `4 * sizeof(void*)`.
   Suggest using a reference to `const` instead.
 * (Simple) ((Foundation)) Warn when a parameter passed by reference to `const` has a size less or equal than `2 * sizeof(void*)`. Suggest passing by value instead.
 * (Simple) ((Foundation)) Warn when a parameter passed by reference to `const` is `move`d.
+* (Not simple) Note: A stricter enforcement would depend on the performance characteristics of the target architecture.
 
 ##### Exception
 
@@ -4671,6 +4672,7 @@ Concrete type rule summary:
 * [C.10: Prefer concrete types over class hierarchies](#rc-concrete)
 * [C.11: Make concrete types regular](#rc-regular)
 * [C.12: Don't make data members `const` or references in a copyable or movable type](#rc-constref)
+* [C.13: If data member `B` uses another data member `A`, declare `A` before `B`](#rc-lifetime)
 
 
 ### <a name="rc-concrete"></a>C.10: Prefer concrete types over class hierarchies
@@ -4791,6 +4793,102 @@ If you need a member to point to something, use a pointer (raw or smart, and `gs
 
 Flag a data member that is `const`, `&`, or `&&` in a type that has any copy or move operation.
 
+
+### <a name="rc-lifetime"></a>C.13: If data member `B` uses another data member `A`, declare `A` before `B`
+
+##### Reason
+
+Data members are initialized in the order they are declared, and destroyed in the reverse order.
+
+##### Discussion
+
+If data member `B` uses another data member `A`, then `A` must be declared before `B` so that `A` outlives `B`, meaning that `A`'s lifetime starts before and ends after `B`'s lifetime. Otherwise, during construction and destruction `B` will attempt to use `A` outside its lifetime.
+
+##### Example; bad
+
+    // Bad: b uses a, but a is declared after b.
+    //      Construction order is b then a; destruction order is a then b.
+    //      So b touches a outside the lifetime of a.
+
+    class X {
+        struct B {
+            string* p;
+            explicit B(string& a) : p{&a} {}
+            ~B() { cout << *p; }                       // uses a (via p)
+        };
+
+        B      b;                                      // constructed first
+        string a = "some heap allocated string value"; // constructed after b; destroyed before b
+
+    public:
+        X() : b{a} {}   // uses a before it is constructed -> use-before-alloc UB
+        ~X() = default; // accesses a after it is destroyed -> use-after-free UB
+    };
+
+##### Example; good
+
+    // Corrected: Just declare a before b
+
+    class X {
+        struct B {
+            string* p;
+            explicit B(string& a) : p{&a} {}
+            ~B() { cout << *p; }                       // uses a (via p)
+        };
+
+        string a = "some heap allocated string value"; // constructed before b; destroyed after b
+        B      b;                                      // constructed second
+
+    public:
+        X() : b{a} {}   // ok
+        ~X() = default; // ok
+    };
+
+##### Example; bad
+
+This can also come up with concurrency. Ensure that an async operation that accesses a value is joined before the value it accesses is destroyed.
+
+    class X {
+    public:
+        X()
+            : a{std::make_unique<int>(12)}
+        {
+            b = std::make_unique<std::jthread>(
+                [this]{
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                std::cout << "Value: " << *a << std::endl;
+              });
+        }
+
+        std::unique_ptr<std::jthread> b;
+        std::unique_ptr<int>          a;
+    };
+
+##### Example; good
+
+This can also come up with concurrency. Ensure that an async operation that accesses a value is joined before the value it accesses is destroyed.
+
+    // Corrected: Just declare a before b
+
+    class X {
+    public:
+        X()
+            : a{std::make_unique<int>(12)}
+        {
+            b = std::make_unique<std::jthread>(
+                [this]{
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                std::cout << "Value: " << *a << std::endl;
+              });
+        }
+
+        std::unique_ptr<int>          a;
+        std::unique_ptr<std::jthread> b;
+    };
+
+##### Enforcement
+
+* Flag a member initializer that refers to an object before it is constructed.
 
 
 ## <a name="s-ctor"></a>C.ctor: Constructors, assignments, and destructors
@@ -5889,7 +5987,7 @@ How would a maintainer know whether `j` was deliberately uninitialized (probably
     class X2 {
         int i {666};
         string s {"qqq"};
-        int j {0};
+        int j {numeric_limits<int>::min()};
     public:
         X2() = default;        // all members are initialized to their defaults
         X2(int ii) :i{ii} {}   // s and j initialized to their defaults
@@ -5903,7 +6001,7 @@ How would a maintainer know whether `j` was deliberately uninitialized (probably
         string s;
         int j;
     public:
-        X3(int ii = 666, const string& ss = "qqq", int jj = 0)
+        X3(int ii = 666, const string& ss = "qqq", int jj = numeric_limits<int>::min())
             :i{ii}, s{ss}, j{jj} { }   // all members are initialized to their defaults
         // ...
     };
@@ -12076,7 +12174,7 @@ The named casts are:
     class B { /* ... */ };
     class D { /* ... */ };
 
-    template<typename D> D* upcast(B* pb)
+    D* downcast(B* pb)
     {
         D* pd0 = pb;                        // error: no implicit conversion from B* to D*
         D* pd1 = (D*)pb;                    // legal, but what is done?
@@ -12517,6 +12615,10 @@ Slicing -- that is, copying only part of an object using assignment or initializ
 the object was meant to be considered as a whole.
 In the rare cases where the slicing was deliberate the code can be surprising.
 
+##### Note
+
+It is not possible to copy part of an empty object, so this definition of slicing deliberately does not include empty objects (having no nonstatic data members), such as empty types used for tag dispatching.
+
 ##### Example
 
     class Shape { /* ... */ };
@@ -12556,7 +12658,7 @@ For example:
 
 ##### Enforcement
 
-Warn against slicing.
+Warn against slicing if the base type has any nonstatic data members (possibly via transitive bases) .
 
 ### <a name="res-construct"></a>ES.64: Use the `T{e}`notation for construction
 
@@ -17074,7 +17176,7 @@ Template interface rule summary:
 * [T.42: Use template aliases to simplify notation and hide implementation details](#rt-alias)
 * [T.43: Prefer `using` over `typedef` for defining aliases](#rt-using)
 * [T.44: Use function templates to deduce class template argument types (where feasible)](#rt-deduce)
-* [T.46: Require template arguments to be at least semiregular](#rt-regular)
+* [T.46: (removed)](#rt-regular)
 * [T.47: Avoid highly visible unconstrained templates with common names](#rt-visible)
 * [T.48: If your compiler does not support concepts, fake them with `enable_if`](#rt-concept-def)
 * [T.49: Where possible, avoid type-erasure](#rt-erasure)
@@ -18110,38 +18212,8 @@ For example:
 
 Flag uses where an explicitly specialized type exactly matches the types of the arguments used.
 
-### <a name="rt-regular"></a>T.46: Require template arguments to be at least semiregular
+### <a name="rt-regular"></a>T.46: (removed)
 
-##### Reason
-
-Readability.
-Preventing surprises and errors.
-Most uses support that anyway.
-
-##### Example
-
-    class X {
-    public:
-        explicit X(int);
-        X(const X&);            // copy
-        X operator=(const X&);
-        X(X&&) noexcept;        // move
-        X& operator=(X&&) noexcept;
-        ~X();
-        // ... no more constructors ...
-    };
-
-    X x {1};              // fine
-    X y = x;              // fine
-    std::vector<X> v(10); // error: no default constructor
-
-##### Note
-
-Semiregular requires default constructible.
-
-##### Enforcement
-
-* Flag types used as template arguments that are not at least semiregular.
 
 ### <a name="rt-visible"></a>T.47: Avoid highly visible unconstrained templates with common names
 
@@ -20466,6 +20538,7 @@ the choice between `'\n'` and `endl` is almost completely aesthetic.
 
 `<regex>` is the standard C++ regular expression library.
 It supports a variety of regular expression pattern conventions.
+For performance-critical work consider a third-party regular expression library.
 
 ## <a name="ss-chrono"></a>SL.chrono: Time
 
